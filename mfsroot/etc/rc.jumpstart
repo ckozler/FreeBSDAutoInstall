@@ -1,0 +1,264 @@
+#!/bin/sh
+
+#
+# The IP to assign once we boot and find out primary network device
+#
+#MY_IP="192.168.1.250"
+
+#
+# FTP information
+#
+# This should be about the only information you will really ever
+# need to change as most of the other stuff relies on specific
+# static things that you shouldnt change unless you know what you're
+# doing
+
+# FTP Host - IP/username
+FTP_HOST="192.168.1.21"
+FTP_DIR="/FreeBSD/8.2-RELEASE/"
+FTP_BASE_FILES="base.tar.gz"
+FTP_KERNEL_FILES="kernels.tar.gz"
+
+FTP_BASE_LINK="ftp://${FTP_HOST}${FTP_DIR}${FTP_BASE_FILES}"
+FTP_KERNEL_LINK="ftp://${FTP_HOST}${FTP_DIR}${FTP_KERNEL_FILES}"
+
+# The mount point on the booted to mfsroot for placing base & kernel files
+# The variables are the same but the install.sh for base & kernel files
+# need the variable DESTDIR available to them so they know where to set the files
+ROOT_TMP_MOUNT="/mnt"
+DESTDIR="${ROOT_TMP_MOUNT}"
+
+# This should always default to /dev/md0
+MFSROOT_DEV="/dev/md0"
+
+# Obtain the primary network device.
+# This is rudimentary at best and will obtain the first device
+# Listed in ifconfig
+#NETDEV=`ifconfig | head -n 1 | cut -d ':' -f1`
+
+# Obtain the primary disk
+# Again, rudimentary at best.
+DISK=`sysctl -a | grep -i kern.disks | cut -d ':' -f2 | tr ' ' '\n' | sed '/^$/d' | sort | head -n 1`
+DISK="/dev/${DISK}"
+#echo "GOT DISK => ${DISK}"
+
+# Set the WORKING_DISK variable to be ${DISK}s1 for slice 1
+# We assume s1 because we use fdisk -I to use the whole disk and make a single
+# slice
+WORKING_DISK="${DISK}s1"
+
+# Paritions below are set through bsdlabel file that we use.
+
+# Set the root partition
+PART_ROOT="${WORKING_DISK}a"
+
+# Set the swap partition
+PART_SWAP="${WORKING_DISK}b"
+
+# Set the usr partition
+PART_USR="${WORKING_DISK}d"
+
+# Set the "extra" storage parititon
+PART_STORE="${WORKING_DISK}e"
+
+
+
+
+##########################
+# Do not edit below these lines unless you need to
+##
+sysctl kern.geom.debugflags=16 
+echo "*************************************"
+echo "*     init based auto-install       *"
+echo "*************************************"
+echo 
+echo
+echo "Starting init based auto-install"
+echo 
+echo
+
+echo " ! Making ${MFSROOT_DEV} read-write for temporary file storage"
+mount -o rw /dev/md0 /
+mount -t devfs dev /dev
+
+if [ $? -ne 0 ]; then echo " ** There was an error mounting ${MFSROOT_DEV}"; exit 1; fi
+
+# Set IP address and let the device settle before continuing on
+echo " ! Setting IP address"
+# TODO: Find a better way to obtain networking...loop through all interfaces found in ifconfig?
+#ifconfig ${NETDEV} ${MY_IP}
+#dhclient ${NETDEV}
+#if [ $? -ne 0 ]; then echo " ** Failed to set networking. Can not continue"; exit 1; fi
+ifconfig | awk '{ print $1 }' | grep : | grep -iv '\(media\|status\)' | tr -d ':' | xargs -I{} dhclient {}
+
+sleep 10
+# Try to ping the FTP host before we go anywhere
+ping -c 3 ${FTP_HOST}
+if [ $? -ne 0 ]; then echo " ** Could not ping FTP host. FTP Host is either down or network configuration failed"; exit 1; fi
+
+
+echo " ! Clearing existing partition table from ${DISK}"
+dd if=/dev/zero of=${DISK} count=50
+sleep 3
+
+echo " ! Executing fdisk to create slice and install boot loader"
+fdisk -BI -a -b /boot/mbr ${DISK}
+sleep 3
+
+echo " ! Writing labels"
+######################################
+# ONLY CHANGE THIS IF YOU ABSOLUTELY #
+# NEED TO. IF YOU DO, YOU MAY HAVE   #
+# TO CHANGE THE VARIABLES ABOVE      #
+# FOR THE PARTITIONS                 #
+######################################
+BSDLABEL_FILE="/var/tmp/bsdLabelFile"
+
+# a = root |  b = swap | c = unused
+# d = usr  |  e = everything else
+echo "
+a:     10G      16      4.2BSD  0       0       0
+b:      4G       *      swap    0       0       0
+c:       *       *      unused  0       0
+d:     10G       *      4.2BSD  0       0       
+e:       *       *      4.2BSD  0       0       
+" > ${BSDLABEL_FILE}
+bsdlabel -R ${WORKING_DISK} ${BSDLABEL_FILE}
+bsdlabel -B -b /boot/boot ${WORKING_DISK}
+sleep 3
+
+echo " ! Running newfs on partitions"
+echo " !! Making root partition on ${PART_ROOT}"
+newfs ${PART_ROOT}
+echo " !! Making usr partition on ${PART_USR}"
+newfs ${PART_USR}
+echo " !! Making store partition on ${PART_STORE}"
+
+echo " ! Mounting temporary root for beginning installation of files"
+mount ${PART_ROOT} ${ROOT_TMP_MOUNT}
+echo " ! Making usr partition on temporary root"
+mkdir -p ${ROOT_TMP_MOUNT}/usr
+echo " ! Mounting ${PART_USR} on ${ROOT_TMP_MOUNT}/usr for installation of files"
+mount ${PART_USR} ${ROOT_TMP_MOUNT}/usr
+
+echo " ! Changing into temporary root to begin install"
+cd ${ROOT_TMP_MOUNT}
+
+echo " ! Fetching base files from ${FTP_BASE_LINK}"
+ftp ${FTP_BASE_LINK}
+
+echo " ! Unpacking files from ${FTP_BASE_FILES}"
+tar -xvzf ${ROOT_TMP_MOUNT}/${FTP_BASE_FILES}
+echo " ! Changing into base files directory"
+cd ${ROOT_TMP_MOUNT}/base
+echo " ! Beginning install of base files"
+export DESTDIR
+echo "y" | sh install.sh
+
+echo " ! Leaving base directory"
+cd ${ROOT_TMP_MOUNT}
+
+echo " ! Fetching kernel files to begin install"
+ftp ${FTP_KERNEL_LINK}
+
+echo " ! Unpacking files from ${FTP_KERNEL_FILES}"
+tar -xvzf ${ROOT_TMP_MOUNT}/${FTP_KERNEL_FILES}
+
+echo " ! Changing into kernel files directory"
+cd ${ROOT_TMP_MOUNT}/kernels
+echo " ! Beginning install of kernel files"
+export DESTDIR
+echo "y" | sh install.sh GENERIC
+
+echo " ! Writing /etc/fstab"
+
+echo -e "${PART_ROOT} \t\t / \t\t ufs \t rw \t\t 1 \t\t 1" > ${ROOT_TMP_MOUNT}/etc/fstab
+echo -e "${PART_SWAP} \t\t none \t\t swap \t sw \t\t 0 \t\t 0" >> ${ROOT_TMP_MOUNT}/etc/fstab
+echo -e "${PART_USR} \t\t /usr \t\t ufs \t rw \t\t 1 \t\t 1" >> ${ROOT_TMP_MOUNT}/etc/fstab
+
+
+# This could probably just be a copy over from GENERIC but a symlink works just as well
+echo " ! Writing symlinks /boot/kernel -> /boot/GENERIC"
+echo " !! Changing into ${ROOT_TMP_MOUNT}/boot"
+cd ${ROOT_TMP_MOUNT}/boot
+echo " !! Deleting kernel directory"
+rm -rfv kernel
+echo " !! Setting symlink"
+ln -s GENERIC kernel
+
+
+# This is where we write extra data
+BUILD_DATE=`date +%Y%m%d`
+BUILD_TIME=`date +%H%M.%S`
+echo -e "Build date & time \n This system was built & installed on ${BUILD_DATE} @ ${BUILD_TIME}" > ${ROOT_TMP_MOUNT}/build.info
+
+
+# Extra packages and configuration
+
+
+RC_CONF="${ROOT_TMP_MOUNT}/etc/rc.conf"
+SH_PROFILE_FILE="${ROOT_TMP_MOUNT}/etc/profile"
+BASH_PROFILE_FILE="${ROOT_TMP_MOUNT}/etc/bashrc.bash"
+
+echo "sshd_enable=\"YES\"" > $RC_CONF
+echo ". /etc/bash.bashrc" >> $SH_PROFILE_FILE
+
+echo '
+alias ls="ls -G"
+alias ll="ls -Gl"
+alias rm="rm -v"
+alias cp="cp -v"
+alias mv="mv -v"
+
+export PAGER=less
+
+#export PS1="[\t][\[\033[0;34m\]\u\[\033[00m\]@\[\033[0;32m\]\h\[\033[00m\]:\[\033[0;31m\]\w\[\033[00m\]]\$ "
+
+if [ "$USER" = "root" ]; then
+	export PS1="[\[\033[0;31m\]*****\[\033[00m\]][\t][\[\033[1;31m\]\u\[\033[00m\]@\[\033[0;32m\]\h\[\033[00m\]:\[\033[0;31m\]\w\[\033[00m\]]\$ "
+else 
+	export PS1="[\[\033[0;31m\]*****\[\033[00m\]][\t][\[\033[0;34m\]\u\[\033[00m\]@\[\033[0;32m\]\h\[\033[00m\]:\[\033[0;31m\]\w\[\033[00m\]]\$ "
+fi
+' > $BASH_PROFILE_FILE
+
+umount /dev
+# Chroot
+chroot /mnt /sbin/mount -t devfs dev /dev
+# Set up networking -- this will give us full routing and DNS
+#ifconfig | awk '{ print $1 }' | grep : | grep -iv '\(media\|status\)' | tr -d ':' | xargs -I{} dhclient {}
+#/usr/sbin/pkg_add -r bash vim sudo lynx
+#chroot /mnt sh -c "/sbin/ifconfig | /usr/bin/awk '{ print $1 }' | /usr/bin/grep : | /usr/bin/grep -iv '\(media\|status\)' | tr -d ':' | xargs -I{} dhclient {}"
+chroot /mnt sh -c "/sbin/ifconfig | /usr/bin/grep flags | /usr/bin/cut -d ':' -f1 | /usr/bin/xargs -I{} /sbin/dhclient {}"
+chroot /mnt sh -c "/usr/sbin/pkg_add -r bash vim sudo lynx"
+
+
+sleep 10
+
+
+echo " ! Beginning cleanup"
+echo " !! Changing into temporary root directory"
+cd ${ROOT_TMP_MOUNT}
+echo " !! Deleting downloaded files (base)"
+rm -rfv base ${FTP_BASE_FILES}
+echo " !! Deleting downloaded files (kernels)"
+rm -rfv kernels ${FTP_KERNEL_FILES}
+echo " !! Changing into /"
+cd /
+echo " !! Unmounting temporary usr file system"
+umount ${ROOT_TMP_MOUNT}/usr
+echo " !! Unmounting temporary dev file system"
+unmount ${ROOT_TMP_MOUNT}/dev
+echo " !! Unmounting temporary root file system"
+umount ${ROOT_TMP_MOUNT}
+
+echo 
+echo
+echo " *** REBOOTING ***"
+echo
+echo
+
+sleep 10
+reboot
+
+
+
